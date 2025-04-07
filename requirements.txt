@@ -1,0 +1,8 @@
+langchain>=0.1.0
+langchain_community>=0.0.19
+torch>=2.0.0
+transformers>=4.38.0
+chromadb>=0.4.22
+numpy>=1.24.0
+mlx>=0.3.0
+mlx-lm>=0.0.3 
