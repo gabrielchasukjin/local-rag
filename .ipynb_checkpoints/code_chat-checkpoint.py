@@ -2,7 +2,7 @@ import os
 import glob
 import torch
 import warnings
-from typing import Any, List, Optional, Dict, Tuple
+from typing import Any, List, Optional
 from langchain_community.vectorstores import Chroma
 from langchain.text_splitter import PythonCodeTextSplitter, RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
@@ -35,10 +35,6 @@ from langchain_core.language_models.llms import LLM
 from langchain_core.callbacks.manager import CallbackManagerForLLMRun
 from transformers import AutoTokenizer, AutoModel
 import subprocess
-from sklearn.feature_extraction.text import TfidfVectorizer
-from rank_bm25 import BM25Okapi
-import numpy as np
-from collections import defaultdict
 
 # Suppress all deprecation warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -206,22 +202,11 @@ class MLXLLM(LLM):
     def _llm_type(self) -> str:
         return "mlx-phi-3"
 
-def setup_qa_chain(vectordb, llm, documents: List[Document], embedding_model: Embeddings):
-    # Create hybrid retriever
-    hybrid_retriever = HybridRetriever(documents, embedding_model)
-    
-    # Create a custom retriever that uses our hybrid approach
-    class HybridRetrieverWrapper:
-        def __init__(self, hybrid_retriever):
-            self.hybrid_retriever = hybrid_retriever
-        
-        def get_relevant_documents(self, query: str) -> List[Document]:
-            return self.hybrid_retriever.get_relevant_documents(query)
-    
+def setup_qa_chain(vectordb, llm):
     qa = RetrievalQA.from_chain_type(
         llm=llm,
         chain_type="stuff",
-        retriever=HybridRetrieverWrapper(hybrid_retriever),
+        retriever=vectordb.as_retriever(search_kwargs={"k": 4}),
         return_source_documents=True
     )
     return qa
@@ -316,103 +301,11 @@ def load_or_create_database():
     )
     return vectordb
 
-class HybridRetriever:
-    def __init__(self, documents: List[Document], embedding_model: Embeddings, k: int = 4):
-        self.documents = documents
-        self.embedding_model = embedding_model
-        self.k = k
-        
-        # Prepare text for BM25
-        self.texts = [doc.page_content for doc in documents]
-        self.tokenized_texts = [text.split() for text in self.texts]
-        self.bm25 = BM25Okapi(self.tokenized_texts)
-        
-        # Prepare TF-IDF
-        self.tfidf_vectorizer = TfidfVectorizer()
-        self.tfidf_matrix = self.tfidf_vectorizer.fit_transform(self.texts)
-        
-        # Prepare embeddings
-        self.embeddings = self.embedding_model.embed_documents(self.texts)
-        self.embeddings = np.array(self.embeddings)
-    
-    def _get_bm25_scores(self, query: str) -> List[float]:
-        tokenized_query = query.split()
-        scores = self.bm25.get_scores(tokenized_query)
-        return scores
-    
-    def _get_tfidf_scores(self, query: str) -> List[float]:
-        query_vec = self.tfidf_vectorizer.transform([query])
-        scores = np.dot(self.tfidf_matrix, query_vec.T).toarray().flatten()
-        return scores
-    
-    def _get_embedding_scores(self, query: str) -> List[float]:
-        query_embedding = self.embedding_model.embed_query(query)
-        scores = np.dot(self.embeddings, query_embedding)
-        return scores
-    
-    def _normalize_scores(self, scores: List[float]) -> List[float]:
-        if not scores:
-            return scores
-        min_score = min(scores)
-        max_score = max(scores)
-        if max_score == min_score:
-            return [0.5] * len(scores)
-        return [(score - min_score) / (max_score - min_score) for score in scores]
-    
-    def get_relevant_documents(self, query: str) -> List[Document]:
-        # Get scores from different methods
-        bm25_scores = self._get_bm25_scores(query)
-        tfidf_scores = self._get_tfidf_scores(query)
-        embedding_scores = self._get_embedding_scores(query)
-        
-        # Normalize scores
-        bm25_scores = self._normalize_scores(bm25_scores)
-        tfidf_scores = self._normalize_scores(tfidf_scores)
-        embedding_scores = self._normalize_scores(embedding_scores)
-        
-        # Combine scores using rank fusion (reciprocal rank fusion)
-        combined_scores = []
-        for i in range(len(self.documents)):
-            # Get ranks for each method
-            bm25_rank = len(bm25_scores) - np.argsort(bm25_scores).argsort()[i]
-            tfidf_rank = len(tfidf_scores) - np.argsort(tfidf_scores).argsort()[i]
-            embedding_rank = len(embedding_scores) - np.argsort(embedding_scores).argsort()[i]
-            
-            # Calculate reciprocal rank fusion score
-            rrf_score = (1 / (60 + bm25_rank)) + (1 / (60 + tfidf_rank)) + (1 / (60 + embedding_rank))
-            combined_scores.append(rrf_score)
-        
-        # Get top k documents
-        top_indices = np.argsort(combined_scores)[-self.k:][::-1]
-        
-        # Deduplicate results
-        seen = set()
-        unique_docs = []
-        for idx in top_indices:
-            doc = self.documents[idx]
-            content = doc.page_content
-            if content not in seen:
-                seen.add(content)
-                unique_docs.append(doc)
-        
-        return unique_docs
-
 def main():
     print("Initializing code chat system...")
     
     # Load or create database
     vectordb = load_or_create_database()
-    
-    # Get the directory where the script is located
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    
-    # Load all documents
-    all_docs = load_documents_from_directory(script_dir)
-    
-    # Initialize embeddings
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
-    print(f"Using device: {device}")
-    embeddings = CustomHuggingFaceEmbeddings(device=device)
     
     # Initialize LLM
     print("Initializing language model...")
@@ -422,8 +315,8 @@ def main():
         temperature=0.25
     )
     
-    # Setup QA chain with hybrid retrieval
-    qa = setup_qa_chain(vectordb, llm, all_docs, embeddings)
+    # Setup QA chain
+    qa = setup_qa_chain(vectordb, llm)
     
     print("\nWelcome to Code Chat! You can ask questions about the codebase.")
     print("Type 'exit' to quit.\n")
